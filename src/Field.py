@@ -8,6 +8,7 @@
 # @date 2015-11-16
 
 import numpy
+from numba import jit, void, int32, float64
 from GridPoint import GridPoint
 
 class Field:
@@ -54,9 +55,9 @@ class Field:
             for j in range(self.N[1]):
                 for k in range(self.N[2]):
                     self.GPs[i, j, k] = GridPoint(
-                            (i + 0.5) * self.dL[0], 
-                            (j + 0.5) * self.dL[1], 
-                            (k + 0.5) * self.dL[2])
+                            (i + 0.5) * self.dL[0] - 0.5 * self.L[0], 
+                            (j + 0.5) * self.dL[1] - 0.5 * self.L[1], 
+                            (k + 0.5) * self.dL[2] - 0.5 * self.L[2])
 
 
     def initE(self, _E):
@@ -109,7 +110,7 @@ class Field:
     def _calIdx(self, X):
         '''
         '''
-        idx = (X / self.dL).astype(numpy.int64)
+        idx = ((X + self.L / 2.) / self.dL).astype(numpy.int64)
         
         for i in range(3):
             if idx[i] == self.N[i]: 
@@ -153,7 +154,9 @@ class Field:
         err = 1000.
         itr_count = 0
 
-        while (err > tol and itr_count < int(1e1)):
+        self.phi[:, :, :] = 0.
+
+        while err > tol and itr_count < int(1e1):
 
             itr_count += 1
 
@@ -167,27 +170,22 @@ class Field:
             self.phi[0, :, :] = self.phi[1, :, :] + self.E0 * self.dL[0]
             self.phi[-1, :, :] = self.phi[-2, :, :] - self.E0 * self.dL[0]
 
-            self.phi[1:-1, 1:-1, 1:-1] = (
-                    (self.phi[2:, 1:-1, 1:-1] + self.phi[:-2, 1:-1, 1:-1]) / dx2 + 
-                    (self.phi[1:-1, 2:, 1:-1] + self.phi[1:-1, :-2, 1:-1]) / dy2 + 
-                    (self.phi[1:-1, 1:-1, 2:] + self.phi[1:-1, 1:-1, :-2]) / dz2 + 
-                    self.tho[1:-1, 1:-1, 1:-1] / eps) / dd
+            GaussSeidel_jit(self.N[0], self.N[1], self.N[2],
+                            dx2, dy2, dz2, dd, eps, self.tho, self.phi)
 
             err = self._residual(eps)
 
-            if (opt == True):
+            if opt:
                 print(itr_count, err)
 
         self.E[0, 1:-1, 1:-1, 1:-1] = - (
-                (self.phi[2:, 1:-1, 1:-1] - self.phi[:-2, 1:-1, 1:-1]) / dx2)
+            (self.phi[2:, 1:-1, 1:-1] - self.phi[:-2, 1:-1, 1:-1]) / self.dL[0])
 
         self.E[1, 1:-1, 1:-1, 1:-1] = - (
-                (self.phi[1:-1, 2:, 1:-1] - self.phi[1:-1, :-2, 1:-1]) / dy2)
+            (self.phi[1:-1, 2:, 1:-1] - self.phi[1:-1, :-2, 1:-1]) / self.dL[1])
 
         self.E[2, 1:-1, 1:-1, 1:-1] = - (
-                (self.phi[1:-1, 1:-1, 2:] - self.phi[1:-1, 1:-1, :-2]) / dz2) 
-
-
+            (self.phi[1:-1, 1:-1, 2:] - self.phi[1:-1, 1:-1, :-2]) / self.dL[2])
 
 
     def _residual(self, eps):
@@ -196,18 +194,17 @@ class Field:
         dx2 = self.dL[0]**2
         dy2 = self.dL[1]**2
         dz2 = self.dL[2]**2
-        dd = 2. * (dx2 + dy2 + dz2)
 
         res = \
-                (self.phi[2:, 1:-1, 1:-1] - 
-                        2. * self.phi[1:-1, 1:-1, 1:-1] + 
-                        self.phi[:-2, 1:-1, 1:-1]) / dx2 + \
-                (self.phi[1:-1, 2:, 1:-1] - 
-                        2. * self.phi[1:-1, 1:-1, 1:-1] + 
-                        self.phi[1:-1, :-2, 1:-1]) / dy2 + \
-                (self.phi[1:-1, 1:-1, 2:] - 
-                        2. * self.phi[1:-1, 1:-1, 1:-1] + 
-                        self.phi[1:-1, 1:-1, :-2]) / dz2 - \
+                (self.phi[2:, 1:-1, 1:-1] -
+                 2. * self.phi[1:-1, 1:-1, 1:-1] +
+                 self.phi[:-2, 1:-1, 1:-1]) / dx2 + \
+                (self.phi[1:-1, 2:, 1:-1] -
+                 2. * self.phi[1:-1, 1:-1, 1:-1] +
+                 self.phi[1:-1, :-2, 1:-1]) / dy2 + \
+                (self.phi[1:-1, 1:-1, 2:] -
+                 2. * self.phi[1:-1, 1:-1, 1:-1] +
+                 self.phi[1:-1, 1:-1, :-2]) / dz2 - \
                 self.tho[1:-1, 1:-1, 1:-1] / eps
         L2res = numpy.sqrt(numpy.sum(res**2))
 
@@ -217,8 +214,6 @@ class Field:
     def updateParticleProps(self, particles):
         '''
         '''
-
-
         for particle in particles:
 
             particle.B = numpy.zeros(3)
@@ -232,3 +227,16 @@ class Field:
                         particle.E += w * self.E[:, i, j, k]
                         particle.B += w * self.B[:, i, j, k]
 
+
+
+@jit(void(int32, int32, int32, float64, float64, float64, float64, float64,
+        float64[:, :, :], float64[:, :, :]), nopython=True, nogil=True)
+def GaussSeidel_jit(Nx, Ny, Nz, dx2, dy2, dz2, dd, eps, tho, phi):
+    for i in range(1, Nx-1):
+        for j in range(1, Ny-1):
+            for k in range(1, Nz-1):
+                phi[i, j, k] = (
+                        (phi[i+1, j, k] + phi[i-1, j, k]) / dx2 + 
+                        (phi[i, j+1, k] + phi[i, j-1, k]) / dy2 + 
+                        (phi[i, j, k+1] + phi[i, j, k-1]) / dz2 + 
+                        tho[i, j, k] / eps) / dd
